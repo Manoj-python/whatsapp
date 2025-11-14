@@ -22,37 +22,56 @@ from .tasks import process_bulk_whatsapp2
 from .utils import format_mobile2
 
 
-# ----------------------------------------------------------
-# Helper: Send plain text message via WhatsApp Cloud API (App2)
-# ----------------------------------------------------------
+# ------------------------
+# Send Text Message
+# ------------------------
 def send_whatsapp2_text(to_number, text_body):
-    """Send a plain text message using WhatsApp2 Cloud API."""
     access_token = settings.WHATSAPP2_ACCESS_TOKEN
     phone_number_id = settings.WHATSAPP2_PHONE_NUMBER_ID
-
     if not access_token or not phone_number_id:
-        raise RuntimeError("WHATSAPP2_ACCESS_TOKEN or PHONE_NUMBER_ID missing in settings.py")
+        raise RuntimeError("Missing WhatsApp2 access token or phone number ID")
 
     url = f"https://graph.facebook.com/v22.0/{phone_number_id}/messages"
-    headers = {
-        "Authorization": f"Bearer {access_token}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "messaging_product": "whatsapp",
-        "to": to_number,
-        "type": "text",
-        "text": {"body": text_body},
-    }
-
+    headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
+    payload = {"messaging_product": "whatsapp", "to": to_number, "type": "text", "text": {"body": text_body}}
     resp = requests.post(url, headers=headers, json=payload, timeout=30)
     resp.raise_for_status()
     return resp.json()
 
+def send_whatsapp2_media(to_number, file_obj, media_type):
+    import requests
+    from django.conf import settings
 
-# ----------------------------------------------------------
-# Upload Excel + Trigger WhatsApp Bulk Sending (App2)
-# ----------------------------------------------------------
+    access_token = settings.WHATSAPP2_ACCESS_TOKEN
+    phone_number_id = settings.WHATSAPP2_PHONE_NUMBER_ID
+
+    if not access_token or not phone_number_id:
+        raise RuntimeError("Missing WhatsApp2 access token or phone number ID")
+
+    # Upload Media
+    upload_url = f'https://graph.facebook.com/v22.0/{phone_number_id}/media'
+    headers = {'Authorization': f'Bearer {access_token}'}
+    files = {'file': (file_obj.name, file_obj, file_obj.content_type)}
+    data = {'messaging_product': 'whatsapp', 'type': media_type}
+
+    resp = requests.post(upload_url, headers=headers, files=files, data=data)
+    resp.raise_for_status()
+    media_id = resp.json().get('id')
+
+    # Send Media Message
+    url = f'https://graph.facebook.com/v22.0/{phone_number_id}/messages'
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": to_number,
+        "type": media_type,
+        media_type: {"id": media_id}
+    }
+    resp2 = requests.post(url, headers=headers, json=payload)
+    resp2.raise_for_status()
+    return resp2.json()
+
+# Upload Excel + Trigger Bulk Sending
+# ------------------------
 def upload_and_send2(request):
     if request.method == "POST":
         form = UploadForm(request.POST, request.FILES)
@@ -80,13 +99,11 @@ def upload_and_send2(request):
             return redirect("job_status2", job_id=job_id)
     else:
         form = UploadForm()
-
     return render(request, "messaging2/index.html", {"form": form})
 
-
-# ----------------------------------------------------------
-# Job Status Page (App2)
-# ----------------------------------------------------------
+# ------------------------
+# Job Status
+# ------------------------
 def job_status2(request, job_id):
     job = get_object_or_404(BulkJob2, job_id=job_id)
     progress = 0
@@ -94,17 +111,14 @@ def job_status2(request, job_id):
         progress = round((job.sent_count / job.total_customers) * 100, 2)
     return render(request, "messaging2/job_status.html", {"job": job, "progress": progress})
 
-
-# ----------------------------------------------------------
-# Chat Dashboard (App2)
-# ----------------------------------------------------------
+## ------------------------
+# Chat Dashboard
+# ------------------------
 def chat_dashboard2(request):
-    mobiles = (
-        SmsWhatsAppLog2.objects
-        .values("mobile")
-        .annotate(last_sent=Max("sent_at"))
-        .order_by("-last_sent")
-    )
+    mobiles = (SmsWhatsAppLog2.objects
+               .values("mobile")
+               .annotate(last_sent=Max("sent_at"))
+               .order_by("-last_sent"))
 
     seen = set()
     mobile_list = []
@@ -114,15 +128,15 @@ def chat_dashboard2(request):
             seen.add(normalized)
             mobile_list.append({"mobile": normalized})
 
-    return render(request, "messaging2/chat.html", {
-        "mobile_list": mobile_list,
-        "MEDIA_URL": settings.MEDIA_URL,
-    })
+    return render(request, "messaging2/chat.html", {"mobile_list": mobile_list, "MEDIA_URL": settings.MEDIA_URL})
 
 
-# ----------------------------------------------------------
-# Fetch Messages API (App2)
-# ----------------------------------------------------------
+
+
+
+# ------------------------
+# Fetch Messages API
+# ------------------------
 def chat_messages_api2(request, mobile):
     normalized = format_mobile2(str(mobile))
     messages_qs = SmsWhatsAppLog2.objects.filter(mobile=normalized).order_by("sent_at")
@@ -154,43 +168,85 @@ def chat_messages_api2(request, mobile):
 
     return JsonResponse({"messages": messages})
 
+import json
+from django.http import JsonResponse, HttpResponseBadRequest
+from django.views.decorators.csrf import csrf_exempt
+from .models import SmsWhatsAppLog2
+  # Your existing utils
+# ------------------------
+# Send Reply API (Text + Media)
+# ------------------------
 
-# ----------------------------------------------------------
-# Send Reply API (App2)
-# ----------------------------------------------------------
 @csrf_exempt
 def send_reply_api2(request):
-    if request.method != "POST":
-        return HttpResponseBadRequest("POST required.")
-
     try:
-        payload = json.loads(request.body.decode("utf-8"))
-        mobile = str(payload.get("mobile", "")).strip()
-        text = payload.get("text", "").strip()
+        if request.method != "POST":
+            return HttpResponseBadRequest("POST required")
 
-        if not mobile or not text:
-            return HttpResponseBadRequest("mobile and text required.")
+        # Handle both JSON and multipart/form-data
+        if request.content_type.startswith("multipart/form-data"):
+            mobile = request.POST.get("mobile", "").strip()
+            text = request.POST.get("text", "").strip()
+            media_file = request.FILES.get("media")
+        else:
+            payload = json.loads(request.body.decode("utf-8"))
+            mobile = payload.get("mobile", "").strip()
+            text = payload.get("text", "").strip()
+            media_file = None
+
+        if not mobile:
+            return HttpResponseBadRequest("mobile required")
 
         mobile = format_mobile2(mobile)
-        api_resp = send_whatsapp2_text(mobile, text)
-
         msg_id = ""
-        if isinstance(api_resp, dict) and "messages" in api_resp and api_resp["messages"]:
-            msg_id = api_resp["messages"][0].get("id", "")
+        content_type = "text"
 
-        SmsWhatsAppLog2.objects.create(
+        # If media file exists
+        if media_file:
+            mime_main = media_file.content_type.split("/")[0]
+            if mime_main == "image":
+                media_type = "image"
+            elif mime_main == "video":
+                media_type = "video"
+            elif mime_main == "audio":
+                media_type = "audio"
+            else:
+                media_type = "document"
+
+            send_resp = send_whatsapp2_media(mobile, media_file, media_type)
+            content_type = media_type
+            if isinstance(send_resp, dict) and "messages" in send_resp:
+                msg_id = send_resp["messages"][0].get("id", "")
+
+            # Send text separately if provided
+            if text:
+                text_resp = send_whatsapp2_text(mobile, text)
+
+        else:
+            # Only text
+            send_resp = send_whatsapp2_text(mobile, text)
+            if isinstance(send_resp, dict) and "messages" in send_resp:
+                msg_id = send_resp["messages"][0].get("id", "")
+
+        # Log the message
+        log = SmsWhatsAppLog2.objects.create(
             customer_name="",
             mobile=mobile,
             template_name="manual",
-            sent_text_message=text,
+            sent_text_message=text or "",
             status="Delivered" if msg_id else "Sent",
             message_id=msg_id,
             message_type="Sent",
+            content_type=content_type,
         )
-        return JsonResponse({"status": "ok", "api_response": api_resp})
 
-    except requests.HTTPError as e:
-        return JsonResponse({"error": "HTTP error", "detail": str(e)}, status=500)
+        # Save media file in log if exists
+        if media_file:
+            log.media_file.save(media_file.name, media_file)
+            log.save()
+
+        return JsonResponse({"status": "ok", "api_response": send_resp})
+
     except Exception as e:
         return JsonResponse({"error": str(e)}, status=500)
 

@@ -1,3 +1,4 @@
+
 """
 Django settings for whatsapp_sender project.
 """
@@ -5,9 +6,23 @@ Django settings for whatsapp_sender project.
 import os
 from pathlib import Path
 from decouple import config, Csv
-import dj_database_url  # Optional if you move to PostgreSQL later
 
 BASE_DIR = Path(__file__).resolve().parent.parent
+
+
+import os
+from celery import Celery
+from dotenv import load_dotenv
+
+# ✅ Load environment variables
+load_dotenv(os.path.join(os.path.dirname(os.path.dirname(__file__)), '.env'))
+
+os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'whatsapp_sender.settings')
+
+app = Celery('whatsapp_sender')
+app.config_from_object('django.conf:settings', namespace='CELERY')
+app.autodiscover_tasks()
+
 
 # ---------------------------------------------------------------------
 # SECURITY & DEBUG
@@ -21,8 +36,6 @@ ALLOWED_HOSTS = config(
     cast=Csv()
 )
 
-# ---------------------------------------------------------------------
-# INSTALLED APPS
 # ---------------------------------------------------------------------
 INSTALLED_APPS = [
     "django.contrib.admin",
@@ -38,7 +51,7 @@ INSTALLED_APPS = [
 
 # ---------------------------------------------------------------------
 # MIDDLEWARE
-# ---------------------------------------------------------------------
+6# ---------------------------------------------------------------------
 MIDDLEWARE = [
     "django.middleware.security.SecurityMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
@@ -51,6 +64,9 @@ MIDDLEWARE = [
 
 ROOT_URLCONF = "whatsapp_sender.urls"
 
+# ---------------------------------------------------------------------
+# TEMPLATES
+# ---------------------------------------------------------------------
 TEMPLATES = [
     {
         "BACKEND": "django.template.backends.django.DjangoTemplates",
@@ -69,8 +85,9 @@ TEMPLATES = [
 
 WSGI_APPLICATION = "whatsapp_sender.wsgi.application"
 
+
 # ---------------------------------------------------------------------
-# DATABASE
+# DATABASE (SQLite for now — replace with PostgreSQL if needed)
 # ---------------------------------------------------------------------
 DATABASES = {
     "default": {
@@ -90,15 +107,16 @@ AUTH_PASSWORD_VALIDATORS = [
 ]
 
 # ---------------------------------------------------------------------
-# LANGUAGE, TIMEZONE
+# INTERNATIONALIZATION
 # ---------------------------------------------------------------------
 LANGUAGE_CODE = "en-us"
 TIME_ZONE = "Asia/Kolkata"
 USE_I18N = True
+USE_L10N = True
 USE_TZ = True
 
 # ---------------------------------------------------------------------
-# AWS S3 STORAGE SETTINGS
+# STATIC & MEDIA FILES (AWS S3)
 # ---------------------------------------------------------------------
 USE_S3 = config("USE_S3", default=False, cast=bool)
 
@@ -106,27 +124,37 @@ if USE_S3:
     AWS_ACCESS_KEY_ID = config("AWS_ACCESS_KEY_ID")
     AWS_SECRET_ACCESS_KEY = config("AWS_SECRET_ACCESS_KEY")
     AWS_STORAGE_BUCKET_NAME = config("AWS_STORAGE_BUCKET_NAME")
-    AWS_S3_REGION_NAME = config("AWS_S3_REGION_NAME")
-    AWS_S3_CUSTOM_DOMAIN = f"{AWS_STORAGE_BUCKET_NAME}.s3.amazonaws.com"
+    AWS_S3_REGION_NAME = config("AWS_S3_REGION_NAME", default="ap-southeast-1")
 
-    STATIC_LOCATION = "static"
-    STATIC_URL = f"https://{AWS_S3_CUSTOM_DOMAIN}/{STATIC_LOCATION}/"
+    # Modern S3 (ACLs disabled)
+    AWS_DEFAULT_ACL = None
+    AWS_S3_OBJECT_PARAMETERS = {
+        "CacheControl": "max-age=86400",
+    }
+    AWS_S3_ADDRESSING_STYLE = "virtual"
+
+    # Static & media URLs
     STATICFILES_STORAGE = "storages.backends.s3boto3.S3Boto3Storage"
-
-    MEDIA_LOCATION = "media"
-    MEDIA_URL = f"https://{AWS_S3_CUSTOM_DOMAIN}/{MEDIA_LOCATION}/"
     DEFAULT_FILE_STORAGE = "storages.backends.s3boto3.S3Boto3Storage"
+
+    STATIC_URL = f"https://{AWS_STORAGE_BUCKET_NAME}.s3.amazonaws.com/static/"
+    MEDIA_URL = f"https://{AWS_STORAGE_BUCKET_NAME}.s3.amazonaws.com/media/"
+
 else:
     STATIC_URL = "/static/"
-    STATIC_ROOT = os.path.join(BASE_DIR, "static")
-
+    STATIC_ROOT = BASE_DIR / "staticfiles"
     MEDIA_URL = "/media/"
-    MEDIA_ROOT = os.path.join(BASE_DIR, "media")
+    MEDIA_ROOT = BASE_DIR / "media"
 
 # ---------------------------------------------------------------------
-# DEFAULT PRIMARY KEY FIELD
+# CELERY + REDIS CONFIG
 # ---------------------------------------------------------------------
-DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
+CELERY_BROKER_URL = config("CELERY_BROKER_URL", default="redis://127.0.0.1:6379/0")
+CELERY_RESULT_BACKEND = config("CELERY_RESULT_BACKEND", default="redis://127.0.0.1:6379/0")
+CELERY_ACCEPT_CONTENT = ["json"]
+CELERY_TASK_SERIALIZER = "json"
+CELERY_RESULT_SERIALIZER = "json"
+CELERY_TIMEZONE = "Asia/Kolkata"
 
 # ---------------------------------------------------------------------
 # WHATSAPP API CREDENTIALS
@@ -136,48 +164,48 @@ WHATSAPP_PHONE_NUMBER_ID = config("WHATSAPP_PHONE_NUMBER_ID")
 WHATSAPP_BUSINESS_ACCOUNT_ID = config("WHATSAPP_BUSINESS_ACCOUNT_ID")
 WHATSAPP_VERIFY_TOKEN = config("WHATSAPP_VERIFY_TOKEN")
 
-WHATSAPP2_ACCESS_TOKEN = config("WHATSAPP2_ACCESS_TOKEN")
-WHATSAPP2_PHONE_NUMBER_ID = config("WHATSAPP2_PHONE_NUMBER_ID")
-WHATSAPP2_BUSINESS_ACCOUNT_ID = config("WHATSAPP2_BUSINESS_ACCOUNT_ID")
-WHATSAPP2_VERIFY_TOKEN = config("WHATSAPP2_VERIFY_TOKEN")
+WHATSAPP2_ACCESS_TOKEN = config("WHATSAPP2_ACCESS_TOKEN", default=None)
+WHATSAPP2_PHONE_NUMBER_ID = config("WHATSAPP2_PHONE_NUMBER_ID", default=None)
+WHATSAPP2_BUSINESS_ACCOUNT_ID = config("WHATSAPP2_BUSINESS_ACCOUNT_ID", default=None)
+WHATSAPP2_VERIFY_TOKEN = config("WHATSAPP2_VERIFY_TOKEN", default=None)
+
+
 
 # ---------------------------------------------------------------------
-# CELERY + REDIS CONFIG
+# SECURITY SETTINGS (recommended for production)
 # ---------------------------------------------------------------------
-CELERY_BROKER_URL = config("CELERY_BROKER_URL")
-CELERY_RESULT_BACKEND = config("CELERY_RESULT_BACKEND")
-CELERY_ACCEPT_CONTENT = ["json"]
-CELERY_TASK_SERIALIZER = "json"
-CELERY_RESULT_SERIALIZER = "json"
-CELERY_TIMEZONE = "Asia/Kolkata"
-CELERY_TASK_ROUTES = {
-    "messaging.tasks.*": {"queue": "whatsapp_main"},
-    "messaging2.tasks.*": {"queue": "whatsapp_secondary"},
+SECURE_SSL_REDIRECT = config("SECURE_SSL_REDIRECT", default=False, cast=bool)
+CSRF_COOKIE_SECURE = config("CSRF_COOKIE_SECURE", default=False, cast=bool)
+SESSION_COOKIE_SECURE = config("SESSION_COOKIE_SECURE", default=False, cast=bool)
+SECURE_BROWSER_XSS_FILTER = True
+SECURE_CONTENT_TYPE_NOSNIFF = True
+
+# ---------------------------------------------------------------------
+# LOGGING
+# ---------------------------------------------------------------------
+LOGGING = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "formatters": {
+        "verbose": {
+            "format": "[{levelname}] {asctime} {name}: {message}",
+            "style": "{",
+        },
+    },
+    "handlers": {
+        "console": {
+            "class": "logging.StreamHandler",
+            "formatter": "verbose",
+        },
+    },
+    "root": {
+        "handlers": ["console"],
+        "level": "INFO",
+    },
 }
 
 # ---------------------------------------------------------------------
-# CSRF / NGROK
+# DEFAULT PRIMARY KEY FIELD TYPE
 # ---------------------------------------------------------------------
-CSRF_TRUSTED_ORIGINS = [
-    "https://lavone-prerestoration-aydan.ngrok-free.dev",
-    "https://ec2-52-221-199-190.ap-southeast-1.compute.amazonaws.com",
-]
+DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
-# ---------------------------------------------------------------------
-# FILE UPLOAD DIRECTORIES
-# ---------------------------------------------------------------------
-UPLOAD_DIR_1 = os.path.join(BASE_DIR, "uploads")
-UPLOAD_DIR_2 = os.path.join(BASE_DIR, "uploads2")
-os.makedirs(UPLOAD_DIR_1, exist_ok=True)
-os.makedirs(UPLOAD_DIR_2, exist_ok=True)
-
-# ---------------------------------------------------------------------
-# SECURITY HEADERS
-# ---------------------------------------------------------------------
-SECURE_BROWSER_XSS_FILTER = True
-SECURE_CONTENT_TYPE_NOSNIFF = True
-SESSION_COOKIE_SECURE = not DEBUG
-CSRF_COOKIE_SECURE = not DEBUG
-SECURE_HSTS_SECONDS = 31536000 if not DEBUG else 0
-SECURE_HSTS_PRELOAD = not DEBUG
-SECURE_HSTS_INCLUDE_SUBDOMAINS = not DEBUG

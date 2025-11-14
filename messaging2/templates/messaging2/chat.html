@@ -3,7 +3,7 @@
 <html>
 <head>
   <meta charset="utf-8">
-  <title>Chat Dashboard (App 2)</title>
+  <title>Chat Dashboard</title>
   <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
   <meta name="csrf-token" content="{{ csrf_token }}">
   <style>
@@ -14,14 +14,18 @@
     .bubble { display: inline-block; padding: 10px 14px; border-radius: 14px; max-width: 70%; }
     .bubble.sent { background: #dcf8c6; }
     .bubble.recv { background: #fff; border: 1px solid #eee; }
-    .chat-image { max-width: 250px; border-radius: 10px; display: block; margin-top: 8px; }
+    .chat-image, .chat-video, .chat-audio { max-width: 250px; border-radius: 10px; display: block; margin-top: 8px; }
+    .chat-window::-webkit-scrollbar { width: 8px; }
+    .chat-window::-webkit-scrollbar-thumb { background: #bbb; border-radius: 10px; }
   </style>
 </head>
 <body>
+  <h1>padma sai holdings private limited</h1>
 <div class="container-fluid">
   <div class="row">
+    <!-- Sidebar -->
     <div class="col-3 sidebar p-3">
-      <h5>Contacts (App 2)</h5>
+      <h5>Contacts</h5>
       <input id="contactSearch" class="form-control mb-2" placeholder="Search number or name">
       <ul id="contactList" class="list-group">
         {% for item in mobile_list %}
@@ -32,16 +36,18 @@
       </ul>
     </div>
 
+    <!-- Chat Area -->
     <div class="col-9 p-3">
       <div id="chatHeader" class="mb-2"><strong>Select a contact</strong></div>
-
       <div id="chatWindow" class="chat-window mb-3">
         <div id="emptyHint" class="text-muted">No conversation selected.</div>
       </div>
 
+      <!-- Composer -->
       <div id="composer" style="display:none;">
-        <div class="input-group">
+        <div class="input-group mb-2">
           <input id="messageInput" type="text" class="form-control" placeholder="Type a message...">
+          <input id="mediaInput" type="file" class="form-control" accept="image/*,video/*,audio/*,application/pdf,.doc,.docx,.xls,.xlsx">
           <button id="sendBtn" class="btn btn-primary">Send</button>
         </div>
       </div>
@@ -54,40 +60,35 @@
 (function () {
   let selectedMobile = null;
   let pollInterval = null;
+  const csrfToken = document.querySelector('meta[name="csrf-token"]').getAttribute('content');
 
-  function setActiveContact(el) {
-    $('.contact-item').removeClass('active');
-    el.addClass('active');
+  function escapeHtml(text) {
+    if (!text) return '';
+    return text.replace(/[&<"']/g, m => ({'&':'&amp;','<':'&lt;','"':'&quot;',"'":'&#039;'}[m]));
   }
 
   function renderMessages(messages) {
     const container = $('#chatWindow');
     container.empty();
     if (!messages.length) {
-      container.append('<div class="text-muted">No messages for this number yet.</div>');
+      container.append('<div class="text-muted">No messages yet.</div>');
       return;
     }
-
     messages.forEach(msg => {
-      let dt = new Date(msg.sent_at);
-      let time = dt.toLocaleString();
-      let content = "";
+      const dt = new Date(msg.sent_at);
+      const time = dt.toLocaleString();
+      let content = '';
 
-      // Handle media display
-      if (msg.content_type === "image" && msg.media_file) {
-        content = `
-          ${msg.sent_text_message ? escapeHtml(msg.sent_text_message) + "<br>" : ""}
-          <img src="${msg.media_file}" class="chat-image" alt="Image message">
-        `;
-      } else if (msg.content_type === "document" && msg.media_file) {
-        content = `
-          ${msg.sent_text_message ? escapeHtml(msg.sent_text_message) + "<br>" : ""}
-          <a href="${msg.media_file}" target="_blank">📄 View Document</a>
-        `;
-      } else if (msg.content_type === "audio" && msg.media_file) {
-        content = `<audio controls><source src="${msg.media_file}" type="audio/mpeg"></audio>`;
-      } else if (msg.content_type === "video" && msg.media_file) {
-        content = `<video controls width="250"><source src="${msg.media_file}" type="video/mp4"></video>`;
+      // Detect content type
+      if (msg.content_type === "image" && msg.media_file)
+        content = `<img src="${msg.media_file}" class="chat-image"><br>${escapeHtml(msg.sent_text_message)}`;
+      else if (msg.content_type === "video" && msg.media_file)
+        content = `<video controls class="chat-video"><source src="${msg.media_file}" type="video/mp4"></video>`;
+      else if (msg.content_type === "audio" && msg.media_file)
+        content = `<audio controls class="chat-audio"><source src="${msg.media_file}" type="audio/mpeg"></audio>`;
+      else if (msg.content_type === "document" && msg.media_file) {
+        const filename = msg.sent_text_message || msg.media_file.split('/').pop();
+        content = `<a href="${msg.media_file}" target="_blank">📄 ${escapeHtml(filename)}</a>`;
       } else {
         content = escapeHtml(msg.sent_text_message);
       }
@@ -99,7 +100,7 @@
         <div class="${alignClass}">
           <div class="bubble ${bubbleClass}">
             ${content}
-            <div class="text-muted small">${time}</div>
+            <div class="text-muted small mt-1">${time}</div>
           </div>
         </div>
       `);
@@ -107,55 +108,68 @@
     container.scrollTop(container[0].scrollHeight);
   }
 
-  function escapeHtml(unsafe) {
-    if (!unsafe) return '';
-    return unsafe.replace(/[&<"']/g, m => ({'&':'&amp;','<':'&lt;','"':'&quot;',"'":'&#039;'}[m]));
-  }
-
   function fetchMessages(mobile) {
-    if (!mobile) return;
-    $.getJSON(`/messaging2/api/messages/${encodeURIComponent(mobile)}/`, function (data) {
+    $.getJSON(`/messaging2/api/messages/${encodeURIComponent(mobile)}/`, function(data) {
       renderMessages(data.messages || []);
     });
   }
 
-  function startPolling(mobile) {
-    if (pollInterval) clearInterval(pollInterval);
-    pollInterval = setInterval(() => fetchMessages(mobile), 3000);
-  }
-
+  // Select contact
   $(document).on('click', '.contact-item', function () {
-    const mobile = $(this).data('mobile');
-    selectedMobile = mobile;
-    setActiveContact($(this));
-    $('#chatHeader').html(`<strong>${mobile}</strong>`);
+    selectedMobile = $(this).data('mobile');
+    $('.contact-item').removeClass('active');
+    $(this).addClass('active');
+    $('#chatHeader').html(`<strong>${selectedMobile}</strong>`);
     $('#composer').show();
-    $('#emptyHint').remove();
-    fetchMessages(mobile);
-    startPolling(mobile);
+    fetchMessages(selectedMobile);
+    if (pollInterval) clearInterval(pollInterval);
+    pollInterval = setInterval(() => fetchMessages(selectedMobile), 4000);
   });
 
+  // Send message
   $('#sendBtn').on('click', function () {
     const text = $('#messageInput').val().trim();
-    if (!text || !selectedMobile) return;
-    const payload = { mobile: selectedMobile, text: text };
+    const file = $('#mediaInput')[0].files[0];
+    if (!selectedMobile) return alert("Select a contact first!");
+    if (!text && !file) return alert("Type a message or select a file!");
+
+    const formData = new FormData();
+    formData.append("mobile", selectedMobile);
+    if (text) formData.append("text", text);
+    if (file) formData.append("media", file);
+
+    $('#sendBtn').prop('disabled', true).html('<span class="spinner-border spinner-border-sm"></span> Sending...');
+
     $.ajax({
       url: '/messaging2/api/send-reply/',
       method: 'POST',
-      headers: {'X-CSRFToken': window.CSRF_TOKEN},
-      data: JSON.stringify(payload),
-      contentType: 'application/json',
+      headers: { 'X-CSRFToken': csrfToken },
+      processData: false,
+      contentType: false,
+      data: formData,
       success: function () {
         $('#messageInput').val('');
+        $('#mediaInput').val('');
         fetchMessages(selectedMobile);
+        $('#sendBtn').prop('disabled', false).html('Send');
       },
       error: function (err) {
         alert('Error sending message: ' + (err.responseJSON?.error || 'unknown'));
+        $('#sendBtn').prop('disabled', false).html('Send');
       }
     });
   });
 
-  $('#contactSearch').on('input', function () {
+  // Enter key to send
+  $('#messageInput').on('keypress', function (e) {
+    if (e.which === 13 && !e.shiftKey) {
+      e.preventDefault();
+      $('#sendBtn').click();
+    }
+  });
+
+  // Contact search
+  $('#contactSearch').on('input', function() {
     const q = $(this).val().toLowerCase();
     $('.contact-item').each(function () {
       const mobile = $(this).data('mobile').toString().toLowerCase();
@@ -163,10 +177,6 @@
     });
   });
 })();
-</script>
-
-<script>
-  window.CSRF_TOKEN = document.querySelector('meta[name="csrf-token"]').getAttribute('content');
 </script>
 </body>
 </html>

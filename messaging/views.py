@@ -1,12 +1,16 @@
-import os
+import io
 import json
+import os
 import uuid
-import time
 import requests
 import pandas as pd
+from openpyxl import Workbook
+from openpyxl.drawing.image import Image as ExcelImage
+
 from django.shortcuts import render, redirect, get_object_or_404
-from django.core.files.storage import FileSystemStorage
-from django.http import JsonResponse, HttpResponseBadRequest, FileResponse, Http404
+from django.core.files.storage import FileSystemStorage, default_storage
+from django.core.files.base import ContentFile
+from django.http import JsonResponse, HttpResponseBadRequest, FileResponse, Http404, HttpResponse
 from django.views.decorators.csrf import csrf_exempt
 from django.conf import settings
 from django.db.models import Max
@@ -17,72 +21,88 @@ from .tasks import process_bulk_whatsapp
 from .utils import format_mobile
 
 
-# ----------------------------------------------------------
-# Helper: Send plain text message via WhatsApp Cloud API
-# ----------------------------------------------------------
+# ---------------------------
+# WhatsApp Cloud API helpers
+# ---------------------------
 def send_whatsapp_text(to_number, text_body):
-    """
-    Sends a plain text message using WhatsApp Cloud API.
-    """
     access_token = settings.WHATSAPP_ACCESS_TOKEN
     phone_number_id = settings.WHATSAPP_PHONE_NUMBER_ID
-    if not access_token or not phone_number_id:
-        raise RuntimeError("Set WHATSAPP_ACCESS_TOKEN and WHATSAPP_PHONE_NUMBER_ID in settings.py")
-
     url = f"https://graph.facebook.com/v17.0/{phone_number_id}/messages"
-    headers = {
-        "Authorization": f"Bearer {access_token}",
-        "Content-Type": "application/json",
-    }
+    headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
     payload = {
         "messaging_product": "whatsapp",
         "to": to_number,
         "type": "text",
         "text": {"body": text_body},
     }
-
     resp = requests.post(url, headers=headers, json=payload, timeout=30)
     resp.raise_for_status()
     return resp.json()
 
 
-# ----------------------------------------------------------
-# Upload Excel + Trigger WhatsApp Bulk Sending
-# ----------------------------------------------------------
+def upload_whatsapp_media(file_obj):
+    """
+    Uploads a media file to WhatsApp cloud and returns the API response.
+    NOTE: this will read the file pointer, so caller may want to seek back to 0 before saving locally.
+    """
+    access_token = settings.WHATSAPP_ACCESS_TOKEN
+    phone_number_id = settings.WHATSAPP_PHONE_NUMBER_ID
+    url = f"https://graph.facebook.com/v17.0/{phone_number_id}/media"
+    headers = {"Authorization": f"Bearer {access_token}"}
+    # make sure to pass raw bytes and filename/content-type
+    file_obj.seek(0)
+    files = {'file': (file_obj.name, file_obj.read(), file_obj.content_type)}
+    data = {'messaging_product': 'whatsapp'}
+    resp = requests.post(url, headers=headers, files=files, data=data, timeout=60)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def send_whatsapp_media(to_number, media_id, media_type, caption=""):
+    access_token = settings.WHATSAPP_ACCESS_TOKEN
+    phone_number_id = settings.WHATSAPP_PHONE_NUMBER_ID
+    url = f"https://graph.facebook.com/v17.0/{phone_number_id}/messages"
+    headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": to_number,
+        "type": media_type,
+        media_type: {"id": media_id},
+    }
+    if caption and media_type in ("image", "video"):
+        payload[media_type]["caption"] = caption
+    resp = requests.post(url, headers=headers, json=payload, timeout=30)
+    resp.raise_for_status()
+    return resp.json()
+
+
+# ---------------------------
+# Bulk upload (unchanged)
+# ---------------------------
 def upload_and_send(request):
     if request.method == "POST":
         form = UploadForm(request.POST, request.FILES)
         if form.is_valid():
             choice = form.cleaned_data["template_choice"]
             excel_file = request.FILES["excel_file"]
-
             fs = FileSystemStorage(location="uploads/")
             filename = fs.save(excel_file.name, excel_file)
             file_path = fs.path(filename)
-
             df = pd.read_excel(file_path, dtype=str).fillna("")
-            total_customers = len(df)
-
             job_id = str(uuid.uuid4())
-            job = BulkJob.objects.create(
+            BulkJob.objects.create(
                 job_id=job_id,
                 template_name=choice,
-                total_customers=total_customers,
+                total_customers=len(df),
                 excel_file=f"uploads/{filename}",
-                status="Pending",
             )
-
             process_bulk_whatsapp.delay(file_path, choice, job_id)
             return redirect("job_status", job_id=job_id)
     else:
         form = UploadForm()
-
     return render(request, "messaging/index.html", {"form": form})
 
 
-# ----------------------------------------------------------
-# Job Status Page
-# ----------------------------------------------------------
 def job_status(request, job_id):
     job = get_object_or_404(BulkJob, job_id=job_id)
     progress = 0
@@ -91,9 +111,9 @@ def job_status(request, job_id):
     return render(request, "messaging/job_status.html", {"job": job, "progress": progress})
 
 
-# ----------------------------------------------------------
-# Download Reports
-# ----------------------------------------------------------
+# ---------------------------
+# Download Reports (example)
+# ---------------------------
 def download_success_report(request, job_id):
     file_path = "success_report.xlsx"
     if os.path.exists(file_path):
@@ -107,27 +127,17 @@ def download_failed_report(request, job_id):
         return FileResponse(open(file_path, "rb"), as_attachment=True, filename=f"failed_report_{job_id}.xlsx")
     raise Http404("Failed report not found.")
 
-from django.conf import settings
-# ----------------------------------------------------------
-# Chat Dashboard
-# ----------------------------------------------------------
 
-
-
-# ----------------------------------------------------------
-# Chat Dashboard
-# ----------------------------------------------------------
+# ---------------------------
+# Chat dashboard
+# ---------------------------
 def chat_dashboard(request):
-    """
-    Renders the chat dashboard with contact list and MEDIA_URL.
-    """
     mobiles = (
         SmsWhatsAppLog.objects
         .values("mobile")
         .annotate(last_sent=Max("sent_at"))
         .order_by("-last_sent")
     )
-
     seen = set()
     mobile_list = []
     for m in mobiles:
@@ -138,110 +148,131 @@ def chat_dashboard(request):
 
     return render(request, "messaging/chat.html", {
         "mobile_list": mobile_list,
-        "MEDIA_URL": settings.MEDIA_URL,  # for JS rendering
+        "MEDIA_URL": settings.MEDIA_URL,
     })
 
 
-# ----------------------------------------------------------
-# Fetch Messages (AJAX)
-# ----------------------------------------------------------
+# ---------------------------
+# Messages API
+# ---------------------------
 def chat_messages_api(request, mobile):
-    """
-    Returns all messages (sent & received) for the given mobile number.
-    Includes proper media URLs for image, video, audio, and document types.
-    """
     normalized = format_mobile(str(mobile))
     messages_qs = SmsWhatsAppLog.objects.filter(mobile=normalized).order_by("sent_at")
-
     messages = []
     for msg in messages_qs:
-        # ✅ Use Django's built-in file URL handling
-        media_url = msg.media_file.url if msg.media_file else ""
-
-        # Clean up message placeholder for media
-        display_text = msg.sent_text_message or ""
-        if display_text.startswith("[Image received"):
-            display_text = "📷 Image"
-        elif display_text.startswith("[Audio"):
-            display_text = "🎧 Audio"
-        elif display_text.startswith("[Video"):
-            display_text = "🎬 Video"
-        elif display_text.startswith("[Document"):
-            display_text = "📄 Document"
-
+        # Use absolute URL if media exists
+        media_url = ""
+        if msg.media_file:
+            try:
+                media_url = request.build_absolute_uri(msg.media_file.url)
+            except Exception:
+                media_url = msg.media_file.url
         messages.append({
             "id": msg.id,
-            "customer_name": msg.customer_name,
             "mobile": msg.mobile,
-            "sent_text_message": display_text,
+            "sent_text_message": msg.sent_text_message or "",
             "message_type": msg.message_type,
-            "sent_at": msg.sent_at,
+            "sent_at": msg.sent_at.isoformat() if msg.sent_at else "",
             "message_id": msg.message_id,
             "content_type": msg.content_type or "text",
-            "media_file": media_url,  # ✅ Correct public URL
+            "media_file": media_url,
         })
-
     return JsonResponse({"messages": messages})
-# ----------------------------------------------------------
-# Send Reply (AJAX)
-# ----------------------------------------------------------
+
+
+# ---------------------------
+# Send reply API (text + media)
+# ---------------------------
 @csrf_exempt
 def send_reply_api(request):
     """
-    Expects JSON: {"mobile": "+911234...", "text": "Reply"}
-    Sends via WhatsApp API and logs it in SmsWhatsAppLog.
+    Accepts:
+      - multipart/form-data (mobile, text, media)
+      - or JSON body {"mobile":"", "text":""}
     """
-    if request.method != "POST":
-        return HttpResponseBadRequest("POST required.")
-
     try:
-        payload = json.loads(request.body.decode("utf-8"))
-        mobile = str(payload.get("mobile", "")).strip()
-        text = payload.get("text", "").strip()
+        if request.method != "POST":
+            return HttpResponseBadRequest("POST required")
 
-        if not mobile or not text:
-            return HttpResponseBadRequest("mobile and text required.")
+        content_type_header = request.META.get("CONTENT_TYPE", "") or request.content_type or ""
+        if content_type_header.startswith("multipart/form-data"):
+            mobile = request.POST.get("mobile", "").strip()
+            text = request.POST.get("text", "").strip()
+            media_file = request.FILES.get("media")
+        else:
+            payload = json.loads(request.body.decode("utf-8") or "{}")
+            mobile = payload.get("mobile", "").strip()
+            text = payload.get("text", "").strip()
+            media_file = None
 
-        # ✅ Always normalize
+        if not mobile:
+            return HttpResponseBadRequest("mobile required")
+
         mobile = format_mobile(mobile)
 
-        api_resp = send_whatsapp_text(mobile, text)
+        if media_file:
+            # Upload to WhatsApp cloud
+            # Ensure file pointer at 0 before reading inside upload_whatsapp_media
+            if hasattr(media_file, "seek"):
+                try:
+                    media_file.seek(0)
+                except Exception:
+                    pass
+            upload_resp = upload_whatsapp_media(media_file)
+            media_id = upload_resp.get("id")
+
+            # Determine basic content type mapping (image, video, audio, document)
+            mime_main = (media_file.content_type.split("/")[0] if media_file.content_type else "").lower()
+            if mime_main in ("image", "video", "audio"):
+                mapped_content_type = mime_main
+            else:
+                # application/* and others -> document
+                mapped_content_type = "document"
+
+            # For WhatsApp message type, use 'image', 'video', 'audio', or 'document'
+            wa_media_type = mapped_content_type
+            send_resp = send_whatsapp_media(mobile, media_id, wa_media_type, caption=text)
+            content_type = mapped_content_type
+        else:
+            send_resp = send_whatsapp_text(mobile, text)
+            content_type = "text"
 
         msg_id = ""
-        if isinstance(api_resp, dict) and "messages" in api_resp and api_resp["messages"]:
-            msg_id = api_resp["messages"][0].get("id", "")
+        if isinstance(send_resp, dict) and "messages" in send_resp:
+            if send_resp["messages"]:
+                msg_id = send_resp["messages"][0].get("id", "")
 
-        SmsWhatsAppLog.objects.create(
+        # Create DB log
+        log = SmsWhatsAppLog.objects.create(
             customer_name="",
             mobile=mobile,
             template_name="manual",
-            sent_text_message=text,
+            sent_text_message=text or "",
             status="Delivered" if msg_id else "Sent",
             message_id=msg_id,
             message_type="Sent",
+            content_type=content_type,
         )
-        return JsonResponse({"status": "ok", "api_response": api_resp})
 
-    except requests.HTTPError as e:
-        return JsonResponse({"error": "HTTP error", "detail": str(e)}, status=500)
+        # Save attached media file locally (rewind pointer if necessary)
+        if media_file:
+            try:
+                if hasattr(media_file, "seek"):
+                    media_file.seek(0)
+            except Exception:
+                pass
+            log.media_file.save(media_file.name, media_file)
+            log.save()
+
+        return JsonResponse({"status": "ok", "api_response": send_resp})
     except Exception as e:
+        # In production, log the exception properly instead of printing
         return JsonResponse({"error": str(e)}, status=500)
 
 
-# ----------------------------------------------------------
-# Webhook: Incoming Messages
-# ----------------------------------------------------------
-import os
-import json
-import requests
-from django.http import JsonResponse, HttpResponseBadRequest
-from django.views.decorators.csrf import csrf_exempt
-from django.conf import settings
-from django.core.files.base import ContentFile
-from .models import SmsWhatsAppLog
-from .utils import format_mobile
-
-
+# ---------------------------
+# Webhook: incoming messages
+# ---------------------------
 @csrf_exempt
 def whatsapp_webhook(request):
     """
@@ -258,7 +289,7 @@ def whatsapp_webhook(request):
 
     if request.method == "POST":
         try:
-            data = json.loads(request.body.decode("utf-8"))
+            data = json.loads(request.body.decode("utf-8") or "{}")
             entries = data.get("entry", [])
             for entry in entries:
                 for change in entry.get("changes", []):
@@ -279,7 +310,7 @@ def whatsapp_webhook(request):
                             text_body = msg["text"].get("body", "")
                             content_type = "text"
 
-                        # --- Interactive (button or list reply) ---
+                        # --- Interactive ---
                         elif msg_type == "interactive":
                             content_type = "interactive"
                             interactive = msg.get("interactive", {})
@@ -332,34 +363,35 @@ def whatsapp_webhook(request):
                             content_type=content_type,
                         )
 
-                        # Attach file if downloaded
+                        # Attach file if downloaded (media_file is (filename, bytes) or None)
                         if media_file:
                             filename, content = media_file
-                            log.media_file.save(filename, ContentFile(content))
-                            log.save()
+                            if filename and content:
+                                log.media_file.save(filename, ContentFile(content))
+                                log.save()
 
             return JsonResponse({"status": "received"})
-
         except Exception as e:
+            # log exception in real app
             print("Webhook error:", e)
             return JsonResponse({"error": str(e)}, status=400)
 
     return HttpResponseBadRequest("Unsupported method.")
 
 
-# ----------------------------------------------------------
-# Helper: Download media from WhatsApp Cloud API
-# ----------------------------------------------------------
+# ---------------------------
+# Helper: download media from WhatsApp Cloud API
+# ---------------------------
 def download_whatsapp_media(media_id):
     """
     Downloads media file from WhatsApp Cloud API using its media_id.
-    Returns tuple: (filename, binary_content)
+    Returns tuple: (filename, binary_content) or None on error.
     """
     try:
         access_token = settings.WHATSAPP_ACCESS_TOKEN
         headers = {"Authorization": f"Bearer {access_token}"}
 
-        # Step 1: get URL
+        # Step 1: get metadata (url + mime)
         meta_url = f"https://graph.facebook.com/v17.0/{media_id}"
         meta_resp = requests.get(meta_url, headers=headers, timeout=30)
         meta_resp.raise_for_status()
@@ -368,67 +400,46 @@ def download_whatsapp_media(media_id):
         mime_type = meta_data.get("mime_type", "")
         extension = mime_type.split("/")[-1] if "/" in mime_type else "bin"
 
-        # Step 2: download actual file
+        # Step 2: download file bytes
         file_resp = requests.get(file_url, headers=headers, timeout=30)
         file_resp.raise_for_status()
         filename = f"whatsapp_{media_id}.{extension}"
-
         return filename, file_resp.content
-
     except Exception as e:
         print("Failed to download media:", e)
         return None
 
 
-
-
-
-import io
-from django.http import HttpResponse
-from openpyxl import Workbook
-from openpyxl.drawing.image import Image as ExcelImage
-from django.core.files.storage import default_storage
-from .models import SmsWhatsAppLog
-
-
+# ---------------------------
+# Export received messages to Excel (images embedded)
+# ---------------------------
 def export_received_messages_to_excel(request):
-    """Export all received messages (text + image) to Excel."""
-    # Create an in-memory workbook
     wb = Workbook()
     ws = wb.active
     ws.title = "Received Messages"
-
-    # Headers
     ws.append(["Mobile", "Message", "Media (if image)"])
 
-    # Filter only received messages
     logs = SmsWhatsAppLog.objects.filter(message_type="Received").order_by("-sent_at")
 
     for log in logs:
         mobile = log.mobile
         message = log.sent_text_message or ""
-
-        # Default add row
         ws.append([mobile, message, ""])
 
-        # If there’s an image, add it in the last column
+        # If there's an image, embed it
         if log.media_file and log.content_type == "image":
-            # Open the image file
-            with default_storage.open(log.media_file.name, "rb") as f:
-                img_data = io.BytesIO(f.read())
-                img = ExcelImage(img_data)
-                img.width = 100  # adjust size
-                img.height = 100
-                # place it in the same row, 3rd column (C)
-                img_cell = f"C{ws.max_row}"
-                ws.add_image(img, img_cell)
+            try:
+                with default_storage.open(log.media_file.name, "rb") as f:
+                    img_data = io.BytesIO(f.read())
+                    img = ExcelImage(img_data)
+                    img.width = 100
+                    img.height = 100
+                    img_cell = f"C{ws.max_row}"
+                    ws.add_image(img, img_cell)
+            except Exception:
+                pass
 
-    # Set response headers
-    response = HttpResponse(
-        content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
+    response = HttpResponse(content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
     response["Content-Disposition"] = 'attachment; filename="received_messages.xlsx"'
-
-    # Save workbook to response
     wb.save(response)
     return response
